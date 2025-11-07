@@ -1,23 +1,24 @@
-name: Build, Push and Deploy to Kubernetes
+name: Build, Push and Deploy to EC2 Kubernetes
 
 on:
   push:
-    branches:
-      - main
+    branches: [ main ]
   workflow_dispatch:
 
 env:
+  # Change to your Docker Hub image name (username/repo)
   IMAGE: mshams0369/new
 
 jobs:
   build-and-deploy:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
 
     steps:
-      - name: Checkout
+      - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Set up QEMU
+      - name: Set up QEMU (for buildx)
         uses: docker/setup-qemu-action@v2
 
       - name: Set up Docker Buildx
@@ -29,7 +30,7 @@ jobs:
           username: ${{ secrets.DOCKER_USERNAME }}
           password: ${{ secrets.DOCKER_TOKEN }}
 
-      - name: Build and push Docker image
+      - name: Build and push Docker image (buildx)
         uses: docker/build-push-action@v4
         with:
           context: .
@@ -40,25 +41,40 @@ jobs:
             ${{ env.IMAGE }}:${{ github.sha }}
           platforms: linux/amd64
 
-      - name: Set up kubectl
-        uses: azure/setup-kubectl@v4
-        with:
-          version: '1.30.0'   # pick a version compatible with your cluster
-
-      - name: Configure Kubeconfig
+      # Install kubectl (explicit binary download — works on GH runners)
+      - name: Install kubectl
         run: |
-          echo "${{ secrets.KUBE_CONFIG_DATA }}" | base64 --decode > kubeconfig
-          mkdir -p $HOME/.kube
-          mv kubeconfig $HOME/.kube/config
-          chmod 600 $HOME/.kube/config
-        shell: bash
+          KUBECTL_VERSION="v1.29.2"
+          curl -LO "https://dl.k8s.io/release/${KUBECTL_VERSION}/bin/linux/amd64/kubectl"
+          chmod +x kubectl
+          sudo mv kubectl /usr/local/bin/kubectl
+          kubectl version --client
 
-      - name: Deploy to Kubernetes (apply manifests)
-        run: |
-          kubectl apply -f k8s/deployment.yaml
-          kubectl apply -f k8s/service.yaml
-          # ensure the Deployment uses the latest image tag (latest)
-          kubectl set image deployment/new-app new-app-container=${{ env.IMAGE }}:latest --record
-          kubectl rollout status deployment/new-app --timeout=120s
+      # Configure kubeconfig from a base64-encoded secret
+      - name: Configure kubeconfig
         env:
-          KUBECONFIG: ${{ github.workspace }}/kubeconfig
+          KUBECONFIG_PATH: ${{ runner.temp }}/kubeconfig
+        run: |
+          echo "Writing kubeconfig to $KUBECONFIG_PATH"
+          echo "${{ secrets.KUBE_CONFIG_DATA }}" | base64 --decode > "$KUBECONFIG_PATH"
+          chmod 600 "$KUBECONFIG_PATH"
+          # set KUBECONFIG env for subsequent kubectl commands
+          echo "KUBECONFIG=$KUBECONFIG_PATH" >> $GITHUB_ENV
+
+      - name: Show cluster info
+        run: |
+          kubectl cluster-info
+          kubectl get nodes -o wide
+
+      - name: Apply K8s manifests
+        run: |
+          # apply all manifests in k8s/ (change path if you use a different folder)
+          kubectl apply -f k8s/
+          # ensure deployment uses latest pushed image
+          kubectl set image deployment/new-app new-app-container=${{ env.IMAGE }}:latest --record || true
+          kubectl rollout status deployment/new-app --timeout=120s
+
+      - name: Print service and pods
+        run: |
+          kubectl get pods -l app=new-app -o wide
+          kubectl get svc new-app-service -o wide
